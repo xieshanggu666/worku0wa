@@ -2,7 +2,7 @@
  * 事故维修工单 功能验证（经理 / 技工 / 保险方协同）
  * 覆盖：结算自动立案（仅自有艇）/ 派工（技工折让费用服务端核定）/
  * 维修（扣款+恢复部件健康+技工心情）/ 验收结案 / 幂等与状态机 /
- * 未结案阻断开赛与常规维护 / 租约艇不建单 / 越站作废对称退维修费 / 老库迁移补单
+ * 未结案阻断开赛、常规维护与赛季衔接 / 租约艇不建单 / 越站作废对称退维修费 / 老库迁移补单
  *
  * 用法：node --experimental-sqlite server/test-repairs.mjs（需要 Node ≥22.5 的 node:sqlite）
  * 在临时目录里起一份独立 DB 与独立端口的真实服务，跑完即销毁，不污染开发库。
@@ -184,6 +184,38 @@ async function main() {
     ok('结案后可正常开赛（不再被维修拦截）', start2c.ok)
     const repeatAccept = await post(PORT, `/api/repairs/${orderId}/accept`, {})
     ok('重复验收幂等', repeatAccept.ok && repeatAccept.already)
+
+    console.log('\n[赛季衔接] 最后一站工单未验收时拒绝开启新赛季，验收后才允许衔接')
+    await post(PORT, '/api/reset')
+    const playMaintained = async cid => {
+      const r = await playStation(PORT, cid)
+      if (r.settled.repair) {
+        const mechNow = (await api(PORT, '/api/state')).mechanics[0]
+        const a = await post(PORT, `/api/repairs/${r.settled.repair.id}/assign`, { mechanicId: mechNow.id })
+        assert.ok(a.ok, '前序工单派工失败：' + (a.msg || ''))
+        const rp = await post(PORT, `/api/repairs/${r.settled.repair.id}/repair`, {})
+        assert.ok(rp.ok, '前序工单维修失败：' + (rp.msg || ''))
+        const ac = await post(PORT, `/api/repairs/${r.settled.repair.id}/accept`, {})
+        assert.ok(ac.ok, '前序工单验收失败：' + (ac.msg || ''))
+      }
+      return r
+    }
+    for (let cid = 1; cid <= 5; cid++) await playMaintained(cid)
+    const seasonGate = (await api(PORT, '/api/state')).team.season
+    const finalRaceId = injectIncidentRace(dir, { circuitId: 6, damage: 18, level: 'major', season: seasonGate, withRepair: 'repaired' })
+    const finalState = await api(PORT, '/api/state')
+    const finalOrder = finalState.repairs.orders.find(o => o.raceId === finalRaceId)
+    eq('第 6 站完季且仍有未验收工单', finalState.seasonComplete, true)
+    eq('末站工单处于 repaired', finalOrder.status, 'repaired')
+    const blockedAdvance = await post(PORT, '/api/seasons/advance', {})
+    eq('未验收工单拒绝衔接', blockedAdvance.ok, false)
+    eq('拦截响应回传工单 id', blockedAdvance.repairOrderId, finalOrder.id)
+    eq('拒绝衔接时仍停留本季', (await api(PORT, '/api/state')).team.season, seasonGate)
+    const acceptGate = await post(PORT, `/api/repairs/${finalOrder.id}/accept`, {})
+    ok('末站工单验收成功', acceptGate.ok)
+    const allowedAdvance = await post(PORT, '/api/seasons/advance', {})
+    ok('验收后衔接成功', allowedAdvance.ok)
+    eq('验收后进入下一季', (await api(PORT, '/api/state')).team.season, seasonGate + 1)
 
     console.log('\n[资金不足] 完工时资金不足被拒，部件不恢复')
     await post(PORT, '/api/reset')

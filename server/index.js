@@ -760,6 +760,7 @@ function contractsPayload(season = teamCore().season) {
  *    历史战绩与排行榜均按赛季分层——老赛季的 races / race_log / contracts 一行不删，继续回放；
  *  - 资金、声望、飞艇（含部件健康）、改装件、机师技工（含经验/心情）、租约（含押金/场次/磨损归属）
  *    属于车队跨赛季资产，全部保留；排行榜快照存入 seasons，供「历届赛季榜」分层展示。
+ *  - 当季自有艇事故维修工单必须先验收结案；否则旧单跨季禁赛，而理赔单随保单到期拒付。
  * 幂等：以 seasons 中是否已有该季档案为唯一闸门（事务内二次校验），并发/重复衔接不产生两份档案。
  */
 // 某赛季滚动战绩统计（完季归档与「当前赛季行」共用同一口径）
@@ -831,6 +832,22 @@ function advanceSeason() {
   if (finishedCount < cs.length) {
     return { status: 409, body: { ok: false, msg: `本赛季还有 ${cs.length - finishedCount} 站未完赛，暂不能进入新赛季` } }
   }
+  // 维修联动：事故工单必须在当季完成派工、维修与双方验收。未验收就衔接会让自有艇把
+  // 当季事故带进新赛季继续禁赛，而事故理赔单又随赛季结束拒付，形成跨季死账；因此完季后
+  // 必须先关闭全部工单（租约艇事故无工单，不影响衔接）。
+  const pendingRepair = openRepairOrders()
+    .find(o => Number(o.season) === season)
+  if (pendingRepair) {
+    const cir = get('SELECT name FROM circuits WHERE id=?', pendingRepair.circuit_id)
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        msg: `自有艇事故维修尚未验收结案（${cir?.name || ''} ${REPAIR_STATUS[pendingRepair.status]?.label || pendingRepair.status}），请先完成维修与双方验收，再进入新赛季`,
+        repairOrderId: pendingRepair.id
+      }
+    }
+  }
 
   let body
   db.exec('BEGIN IMMEDIATE')
@@ -838,6 +855,10 @@ function advanceSeason() {
     // 事务内二次闸门：同步并发下只有一个衔接请求能穿过
     if (get('SELECT season FROM seasons WHERE season=?', season)) {
       body = { ok: true, already: true, msg: '新赛季已经开启', season: season + 1 }
+    } else if (get("SELECT id FROM repair_orders WHERE season=? AND status IN ('draft','assigned','repaired') LIMIT 1", season)) {
+      body = { ok: false, msg: '自有艇事故维修尚未验收结案，请先完成维修与双方验收，再进入新赛季' }
+      db.exec('ROLLBACK')
+      return { status: 409, body }
     } else {
       // 1) 归档老赛季最终战绩到排行榜（races/race_log/contracts 原样保留，回放不受影响）
       const live = seasonLiveStats(season)
@@ -950,13 +971,18 @@ function repairOrderByRace(raceId) {
   return repairOrderView(repairOrderRowByRace(raceId))
 }
 function repairsPayload() {
+  const season = Number(teamCore().season) || 1
   const rows = all("SELECT * FROM repair_orders WHERE status!='void' ORDER BY id DESC")
   const open = rows.filter(r => r.status !== 'accepted')
+  const seasonOpen = open.filter(r => Number(r.season) === season)
   return {
     orders: rows.map(repairOrderView),
     // 待办徽标：未结案工单数（航线图 / 机库据此提示「未修飞艇禁赛」）
     openCount: open.length,
     blocked: open.length > 0,
+    // 新赛季衔接只看当季工单；理论上旧工单不应跨季（衔接接口会拦截），字段也兼容异常老库
+    seasonOpenCount: seasonOpen.length,
+    seasonBlocked: seasonOpen.length > 0,
     rate: OWN_REPAIR_RATE
   }
 }
@@ -1832,9 +1858,9 @@ app.post('/api/races/:id/settle', (req, res) => {
   }
 })
 
-// 新赛季衔接：6 站完赛后由玩家确认触发。归档老赛季排行榜快照、重置积分/赛站/合约滚动层，
-// 老赛季 races/race_log/contracts 原样保留（历史战绩与回放不丢）；车队资金/声望/装备/人员/租约保留。
-// 幂等：重复点击 / 并发重放只衔接一次（seasons 归档行为唯一闸门）
+// 新赛季衔接：6 站完赛且当季事故工单全部验收后由玩家确认触发。归档老赛季排行榜快照、重置积分/
+// 赛站/合约滚动层，老赛季 races/race_log/contracts 原样保留（历史战绩与回放不丢）；车队资金/
+// 声望/装备/人员/租约保留。幂等：重复点击 / 并发重放只衔接一次（seasons 归档行为唯一闸门）
 app.post('/api/seasons/advance', (_, res) => {
   const r = advanceSeason()
   return res.status(r.status).json(r.body)

@@ -44,9 +44,10 @@ const lineupTxt = computed(() => {
 const starting = ref(false)
 // 6 站全部完赛（尚未衔接）：航线终点弹出完季浮条，衔接新赛季而不是停在终点
 const seasonComplete = computed(() => store.seasonComplete && circuits.value.length > 0)
+const repairsBlocked = computed(() => !!(store.repairs.seasonOpenCount ?? store.repairs.openCount))
 const advancing = ref(false)
 async function advance() {
-  if (advancing.value) return
+  if (advancing.value || repairsBlocked.value) return
   advancing.value = true
   const r = await store.advanceSeason()
   advancing.value = false
@@ -192,8 +193,14 @@ function resume() { if (active.value) emit('view', active.value, 'live') }
         <div class="se-main">
           <b>第 {{ store.team.season }} 赛季 6 站全部完赛！</b>
           <span>积分 / 赛站 / 合约 / 排行榜分层重置，资金飞艇与班底保留，往季回放随时可看</span>
+          <span v-if="repairsBlocked" class="se-repair-warn">
+            🔧 {{ store.repairs.seasonOpenCount ?? store.repairs.openCount }} 张当季事故维修工单未验收；先完成维修和双方验收，避免当季理赔随赛季结束拒付
+          </span>
         </div>
-        <button class="se-go" :disabled="advancing" @click="advance">
+        <button v-if="repairsBlocked" class="se-go se-repair" @click="emit('repair')">
+          🔧 前往验收工单
+        </button>
+        <button v-else class="se-go" :disabled="advancing" @click="advance">
           {{ advancing ? '开启中…' : `🚀 进入第 ${store.team.season + 1} 赛季` }}
         </button>
       </div>

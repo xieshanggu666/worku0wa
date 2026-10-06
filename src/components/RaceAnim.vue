@@ -80,6 +80,8 @@ const incidentView = computed(() => {
 const seasonStats = computed(() =>
   store.seasons.find(x => x.current && x.season === rec.value.season) ||
   store.seasons.find(x => x.season === rec.value.season) || null)
+// 当季事故工单未验收时，服务端会拒绝衔接；结算卡引导先完成维修，避免保单到期后理赔成死账
+const repairsBlocked = computed(() => !!(store.repairs.seasonOpenCount ?? store.repairs.openCount))
 // 赛道分段几何：可行驶区间 6% → 94%（宽 88%），三等分
 const TRACK_L = 6, TRACK_W = 88
 const segDividers = [1, 2].map(i => +(TRACK_L + TRACK_W / 3 * i).toFixed(2))
@@ -144,7 +146,7 @@ async function goBack() {
 }
 // 6 站完赛 → 衔接新赛季：服务端归档排行榜、分层重置；成功后返回航线（App 会再次刷新状态）
 async function startNewSeason() {
-  if (advancing.value) return
+  if (advancing.value || repairsBlocked.value) return
   advancing.value = true
   const r = await store.advanceSeason()
   advancing.value = false
@@ -318,8 +320,11 @@ onUnmounted(() => { if (raf) cancelAnimationFrame(raf) })
                 <span><b class="mono">¥{{ seasonStats.payouts ?? 0 }}</b>保险赔付</span>
               </div>
               <div class="ss-note">资金、声望、飞艇、改装与班底保留；积分、赛站、合约与排行榜进入新赛季分层重置，往季回放可在「赛季之巅」随时观看</div>
-              <button class="btn primary s-btn ss-go" :disabled="advancing" @click="startNewSeason">
-                {{ advancing ? '正在开启新赛季…' : `🚀 进入第 ${rec.season + 1} 赛季` }}
+              <div v-if="repairsBlocked" class="cl-warn">
+                🔧 尚有 {{ store.repairs.seasonOpenCount ?? store.repairs.openCount }} 张当季事故维修工单未验收结案；请先派工、维修并完成双方验收，否则保单到期后当季理赔将无法赔付。
+              </div>
+              <button class="btn primary s-btn ss-go" :disabled="advancing || repairsBlocked" @click="startNewSeason">
+                {{ repairsBlocked ? `🔧 先完成 ${store.repairs.seasonOpenCount ?? store.repairs.openCount} 张工单验收` : advancing ? '正在开启新赛季…' : `🚀 进入第 ${rec.season + 1} 赛季` }}
               </button>
             </div>
           </template>
