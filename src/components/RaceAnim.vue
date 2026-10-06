@@ -80,6 +80,13 @@ const incidentView = computed(() => {
 const seasonStats = computed(() =>
   store.seasons.find(x => x.current && x.season === rec.value.season) ||
   store.seasons.find(x => x.season === rec.value.season) || null)
+// 完季时仍有未验收工单，服务端会拒绝衔接；结算卡直接引导先完成维修验收
+const seasonRepairBlocked = computed(() => store.repairs?.blocked || false)
+const pendingPayableClaims = computed(() =>
+  (store.insurance?.incidents || []).filter(i =>
+    ['reported', 'assessed'].includes(i.status) &&
+    (i.elig?.canAssess || i.elig?.canPayout)).length)
+const seasonClaimBlocked = computed(() => pendingPayableClaims.value > 0)
 // 赛道分段几何：可行驶区间 6% → 94%（宽 88%），三等分
 const TRACK_L = 6, TRACK_W = 88
 const segDividers = [1, 2].map(i => +(TRACK_L + TRACK_W / 3 * i).toFixed(2))
@@ -318,8 +325,16 @@ onUnmounted(() => { if (raf) cancelAnimationFrame(raf) })
                 <span><b class="mono">¥{{ seasonStats.payouts ?? 0 }}</b>保险赔付</span>
               </div>
               <div class="ss-note">资金、声望、飞艇、改装与班底保留；积分、赛站、合约与排行榜进入新赛季分层重置，往季回放可在「赛季之巅」随时观看</div>
-              <button class="btn primary s-btn ss-go" :disabled="advancing" @click="startNewSeason">
-                {{ advancing ? '正在开启新赛季…' : `🚀 进入第 ${rec.season + 1} 赛季` }}
+              <div v-if="seasonRepairBlocked" class="ss-repair-warn">
+                🔧 {{ store.repairs.openCount }} 张事故维修工单尚未验收结案，必须先完成维修验收，才能进入新赛季
+                <button class="btn ghost sm s-btn" @click="emit('repair')">前往维修工单</button>
+              </div>
+              <div v-else-if="seasonClaimBlocked" class="ss-repair-warn">
+                🛡️ {{ pendingPayableClaims }} 笔可赔付理赔单尚未结案，必须先完成定损赔付，才能进入新赛季
+                <button class="btn ghost sm s-btn" @click="emit('claim')">前往保险理赔</button>
+              </div>
+              <button class="btn primary s-btn ss-go" :disabled="advancing || seasonRepairBlocked || seasonClaimBlocked" @click="startNewSeason">
+                {{ seasonRepairBlocked ? '🔧 请先完成维修验收' : seasonClaimBlocked ? '🛡️ 请先完成理赔' : advancing ? '正在开启新赛季…' : `🚀 进入第 ${rec.season + 1} 赛季` }}
               </button>
             </div>
           </template>

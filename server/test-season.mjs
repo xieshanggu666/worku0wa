@@ -1,5 +1,5 @@
 /**
- * 新赛季衔接 功能验证（完季归档 / 分层重置 / 回放保留 / 排行榜分层 / 幂等）
+ * 新赛季衔接 功能验证（完季归档 / 分层重置 / 回放保留 / 排行榜分层 / 幂等 / 维修与理赔闸门）
  *
  * 用法：node server/test-season.mjs（需要 Node ≥22.5 的 node:sqlite）
  * 在临时目录里起一份独立 DB 与独立端口的真实服务，跑完即销毁，不污染开发库。
@@ -109,7 +109,90 @@ async function scenario() {
     eq('幂等重放仍告知 seasonComplete', lastAgain.seasonComplete, true)
     void replaySettle
 
-    /* ---- 4. 触发衔接：归档第 1 季并分层重置 ---- */
+    /* ---- 4. 完季时未验收维修工单阻断衔接；结案后才允许开启新赛季 ---- */
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      const lastRow = dbh.prepare('SELECT * FROM races WHERE circuit_id=6 AND season=1').get()
+      const rec = JSON.parse(lastRow.record)
+      let orderId = dbh.prepare('SELECT id FROM repair_orders WHERE race_id=?').get(lastRow.id)?.id
+      let gateDamage = 0
+      if (!orderId) {
+        // 确定性地补齐「最后一站自有艇事故 + draft 工单 + 已拒付留档理赔」现场
+        gateDamage = 5
+        rec.incident = { level: 'minor', damage: gateDamage, cause: '完季工单闸门测试' }
+        dbh.prepare('UPDATE races SET record=? WHERE id=?').run(JSON.stringify(rec), lastRow.id)
+        const incId = dbh.prepare(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,status,created_at,reported_at,rejected_at)
+          VALUES (?,?,?,?,?,?,'rejected',?,?,?)`)
+          .run(lastRow.id, lastRow.season, lastRow.circuit_id, 'minor', '完季工单闸门测试', gateDamage, lastRow.created_at, lastRow.created_at, lastRow.created_at).lastInsertRowid
+        orderId = dbh.prepare(`INSERT INTO repair_orders (race_id,incident_id,season,circuit_id,level,cause,damage,status,created_at)
+          VALUES (?,?,?,?,?,?,?, 'draft', ?)`)
+          .run(lastRow.id, Number(incId), lastRow.season, lastRow.circuit_id, 'minor', '完季工单闸门测试', gateDamage, lastRow.created_at).lastInsertRowid
+      } else {
+        dbh.prepare("UPDATE repair_orders SET status='draft', assigned_at=NULL, repaired_at=NULL, accepted_at=NULL WHERE id=?").run(orderId)
+        dbh.prepare("UPDATE incidents SET status='rejected', rejected_at=COALESCE(reported_at, ?) WHERE id=(SELECT incident_id FROM repair_orders WHERE id=?)")
+          .run(lastRow.created_at, orderId)
+      }
+      dbh.close()
+
+      const blocked = await post(PORT, '/api/seasons/advance', {})
+      eq('未验收维修工单存在时拒绝衔接', blocked.ok, false)
+      ok('拒绝原因指向维修工单', /维修工单|验收/.test(blocked.msg || ''))
+      eq('被拒后仍停留在第 1 季', (await api(PORT, '/api/state')).team.season, 1)
+
+      // 工单结案是唯一放行条件；直接置为 accepted 模拟派工→维修→验收完成（本场景只验证衔接闸门）
+      const dbh2 = new DatabaseSync(path.join(dir, 'sky.db'))
+      if (gateDamage) {
+        dbh2.prepare('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=1')
+          .run(gateDamage, gateDamage)
+      }
+      dbh2.prepare("UPDATE repair_orders SET status='accepted', accepted_at=? WHERE id=?").run(String(Date.now()), orderId)
+      dbh2.close()
+      const reopened = await api(PORT, '/api/state')
+      eq('工单结案后未结案数归零', reopened.repairs.openCount, 0)
+    }
+
+    let gatePayout = 0
+    /* ---- 5. 可赔付未决理赔同样阻断衔接；完成赔付后才允许归档 ---- */
+    {
+      // 用上一步已结案维修单的事故，构造一张「有效保单先于开赛、已报案待定损」的可赔付未决单
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      const lastRow = dbh.prepare('SELECT * FROM races WHERE circuit_id=6 AND season=1').get()
+      const hadPolicy = !!(await api(PORT, '/api/state')).insurance.policy
+      const beforeMoney = (await api(PORT, '/api/state')).team.money
+      if (!hadPolicy) {
+        // 直接落一份先于该场开赛生效的全险，并同步扣保费，构造可赔付未决单
+        dbh.prepare(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,quota,paid_total,status,created_at)
+          VALUES (3,?,1,4800,1.0,15000,36000,0,'active',?)`)
+          .run('苍穹·旗舰全险', lastRow.created_at)
+        dbh.prepare('UPDATE team SET money=money-4800 WHERE id=1').run()
+      } else {
+        const policyId = (await api(PORT, '/api/state')).insurance.policy.id
+        dbh.prepare('UPDATE insurance SET created_at=?, status=? WHERE id=?')
+          .run(lastRow.created_at, 'active', policyId)
+      }
+      const moneyAfterBuy = (await api(PORT, '/api/state')).team.money
+      eq('保单费用计入车队资金', Math.round(moneyAfterBuy), Math.round(beforeMoney - (hadPolicy ? 0 : 4800)))
+      const order = dbh.prepare('SELECT incident_id FROM repair_orders WHERE race_id=?').get(lastRow.id)
+      const incidentId = order.incident_id
+      const nowTs = String(Date.now())
+      dbh.prepare(`UPDATE incidents
+        SET status='reported', rejected_at=NULL, reported_at=COALESCE(reported_at, ?), assessed=0, repair_cost=0, payout=0, claim_id=NULL
+        WHERE id=?`).run(nowTs, incidentId)
+      dbh.close()
+
+      const blockedReport = await post(PORT, '/api/seasons/advance', {})
+      eq('已报案待定损时拒绝衔接', blockedReport.ok, false)
+      ok('拒绝原因指向理赔单', /理赔|赔付|定损/.test(blockedReport.msg || ''))
+      const assess = await post(PORT, `/api/incidents/${incidentId}/assess`, {})
+      ok('衔接前可完成定损', assess.ok)
+      const blockedAssess = await post(PORT, '/api/seasons/advance', {})
+      eq('已定损待赔付时仍拒绝衔接', blockedAssess.ok, false)
+      const pay = await post(PORT, `/api/incidents/${incidentId}/payout`, {})
+      ok('衔接前可完成赔付', pay.ok)
+      gatePayout = pay.payout || 0
+    }
+
+    /* ---- 6. 触发衔接：归档第 1 季并分层重置 ---- */
     const adv = await post(PORT, '/api/seasons/advance', {})
     ok('衔接成功', adv.ok && !adv.already)
     eq('进入第 2 季', adv.season, 2)
@@ -127,14 +210,14 @@ async function scenario() {
     eq('新赛季 seasonComplete=false', s2.seasonComplete, false)
     eq('新赛季进度 0/6', s2.seasonDone, 0)
 
-    /* ---- 5. 重复衔接幂等，不二次归档 ---- */
+    /* ---- 7. 重复衔接幂等，不二次归档 ---- */
     const advAgain = await post(PORT, '/api/seasons/advance', {})
     ok('重复衔接返回幂等结果', advAgain.ok && advAgain.already)
     const s2b = await api(PORT, '/api/state')
     eq('幂等衔接不改变当前赛季', s2b.team.season, 2)
     eq('幂等衔接不改变积分', s2b.team.season_pts, 0)
 
-    /* ---- 6. 跨赛季资产保留：资金/声望/飞艇磨损/租约 ---- */
+    /* ---- 8. 跨赛季资产保留：资金/声望/飞艇磨损/租约 ---- */
     const prize1 = log1.reduce((a, l) => a + l.money, 0)
     // 6 场比赛记录中的事故快照：事故损伤与事故声望扣减（严重-1/坠毁-3）随赛季滚动
     const s1Recs = sFull.races.filter(r => r.record?.season === 1).map(r => r.record)
@@ -150,7 +233,7 @@ async function scenario() {
     const repairFeesS1 = (sFull.repairs?.orders || [])
       .filter(o => o.status === 'accepted' && o.season === 1)
       .reduce((a, o) => a + (o.fee || 0), 0)
-    const expectedMoney = money0 - (2400 + 600) + prize1 + earnedInS1 - repairFeesS1
+    const expectedMoney = money0 - (2400 + 600) + prize1 + earnedInS1 - repairFeesS1 - 4800 + gatePayout
     eq('资金跨赛季保留（含第 1 季合约兑现）', Math.round(s2.team.money), Math.round(expectedMoney))
     const repGain1 = sFull.seasons.find(x => x.season === 1).rep
     const repContracts = sFull.contracts.filter(c => c.earned).reduce((a, c) => a + c.rep, 0)
@@ -165,6 +248,8 @@ async function scenario() {
       const afterSettle = Math.max(5, pdSim - wear - dmg)
       pdSim = Math.min(100, afterSettle + dmg)
     }
+    // 闸门测试注入的事故损伤未经过真实结算；手动结案前按 5 点损伤做了同口径恢复
+    pdSim = Math.min(100, pdSim + gateDamage)
     eq('自有艇磨损跨赛季保留（正常磨损逐站结算，事故损伤已由工单修复）', s2.airship.parts_dur, pdSim)
     const rt = s2.rental
     ok('在履租约跨赛季保留', !!rt && rt.status === 'active')
@@ -172,7 +257,7 @@ async function scenario() {
     eq('租约累计磨损跨赛季（正常磨损+事故损伤）', rt.wear_total, rentalWear + incDamageRental)
     eq('租约剩余场次保留（还能再跑 1 场）', rt.max_races - rt.races_used, 1)
 
-    /* ---- 7. 排行榜按赛季分层：第 1 季归档行 + 第 2 季滚动行 ---- */
+    /* ---- 9. 排行榜按赛季分层：第 1 季归档行 + 第 2 季滚动行 ---- */
     eq('赛季榜共 2 行（S1 归档 + S2 进行中）', s2.seasons.length, 2)
     const row1 = s2.seasons.find(x => x.season === 1)
     const row2 = s2.seasons.find(x => x.season === 2)
@@ -183,14 +268,14 @@ async function scenario() {
     eq('S2 滚动积分=0', row2.pts, 0)
     eq('S2 滚动场次=0', row2.racesN, 0)
 
-    /* ---- 8. 合约按赛季分层：第 2 季重签一套全新合约，进度归零 ---- */
+    /* ---- 10. 合约按赛季分层：第 2 季重签一套全新合约，进度归零 ---- */
     eq('第 2 季合约数量=配置数量', s2.contracts.length, 4)
     ok('第 2 季合约均未兑现', s2.contracts.every(c => !c.earned))
     ok('第 2 季条款进度全部归零',
       s2.contracts.every(c => c.terms.every(t => t.value === 0 || t.type === 'points' && t.value === 0)))
     eq('第 2 季合约归属 season=2', s2.contracts.every(c => c.season === 2), true)
 
-    /* ---- 9. 历史战绩与回放保留：老赛季 6 场仍在、可回放、不重结算 ---- */
+    /* ---- 11. 历史战绩与回放保留：老赛季 6 场仍在、可回放、不重结算 ---- */
     eq('历史仍含全部 6 场第 1 季记录', s2.races.filter(r => r.record.season === 1).length, 6)
     ok('第 1 季记录全部可回放（status=settled）', s2.races.every(r => r.status === 'settled'))
     const oldRaceId = s2.races.find(r => r.record.circuit.id === 3).id
@@ -198,7 +283,7 @@ async function scenario() {
     ok('老赛季比赛重复结算走幂等', oldAgain.ok && oldAgain.already)
     eq('幂等重放不产生积分（第 2 季仍为 0）', (await api(PORT, '/api/state')).team.season_pts, 0)
 
-    /* ---- 10. 第 2 季第 1 站重新解锁，可开赛、可结算，积分重新累计 ---- */
+    /* ---- 12. 第 2 季第 1 站重新解锁，可开赛、可结算，积分重新累计 ---- */
     const n1 = await post(PORT, '/api/races/start/1', {})
     ok('第 2 季第 1 站可开赛', n1.ok)
     eq('新比赛记录归属第 2 季', n1.race.record.season, 2)
@@ -213,7 +298,7 @@ async function scenario() {
     eq('S1 归档积分不受新赛季比赛影响', s3.seasons.find(x => x.season === 1).pts, pts1)
     eq('历史新增第 2 季 1 场（共 7 场）', s3.races.length, 7)
 
-    /* ---- 11. 直连 DB：归档行、老合约行、老流水都在；老 races 仍 settled ---- */
+    /* ---- 13. 直连 DB：归档行、老合约行、老流水都在；老 races 仍 settled ---- */
     proc.kill('SIGKILL'); proc = null; await sleep(150)
     const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
     const arch = dbh.prepare('SELECT * FROM seasons WHERE season=1').get()
@@ -239,7 +324,7 @@ async function scenario() {
     eq('第 2 季仅第 1 站完成', circuitsOpen, 1)
     dbh.close()
 
-    /* ---- 12. 重启幂等：归档不重复、赛季不跳号、老数据可继续回放 ---- */
+    /* ---- 14. 重启幂等：归档不重复、赛季不跳号、老数据可继续回放 ---- */
     proc = startServer(dir, PORT)
     const sr = await waitReady(PORT)
     eq('重启后仍处于第 2 季', sr.team.season, 2)
@@ -252,7 +337,7 @@ async function scenario() {
     const earnedAfter = sr.contracts.filter(c => c.earned).map(c => c.id).sort()
     eq('重启前后已兑现合约集合一致（不重复兑现）', JSON.stringify(earnedAfter), JSON.stringify(earnedBefore))
 
-    /* ---- 13. 存在 running 比赛时拒绝衔接（保护唯一事实来源） ---- */
+    /* ---- 15. 存在 running 比赛时拒绝衔接（保护唯一事实来源） ---- */
     await post(PORT, '/api/races/start/2', {})
     const busy = await post(PORT, '/api/seasons/advance', {})
     eq('比赛进行中拒绝衔接', busy.ok, false)

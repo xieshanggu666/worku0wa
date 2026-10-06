@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useSkyStore } from '@/store/sky'
 const store = useSkyStore()
-const emit = defineEmits(['view', 'repair'])
+const emit = defineEmits(['view', 'repair', 'insurance'])
 
 const wIco = { '晴': '🌤️', '风': '🌬️', '雨': '🌧️', '雾': '🌫️', '雷暴': '⛈️' }
 // 浮岛在航线图上的坐标（左下→右上一条上升的航线）
@@ -44,6 +44,14 @@ const lineupTxt = computed(() => {
 const starting = ref(false)
 // 6 站全部完赛（尚未衔接）：航线终点弹出完季浮条，衔接新赛季而不是停在终点
 const seasonComplete = computed(() => store.seasonComplete && circuits.value.length > 0)
+// 完季但事故维修工单未结案：先处理旧工单，避免新赛季被旧工单继续禁赛
+const seasonRepairBlocked = computed(() => seasonComplete.value && !!store.repairs?.blocked)
+// 仍满足赔付条件的未决理赔单（报案/定损中）：先赔付，避免保单到期后被拒付
+const pendingPayableClaims = computed(() =>
+  (store.insurance?.incidents || []).filter(i =>
+    ['reported', 'assessed'].includes(i.status) &&
+    (i.elig?.canAssess || i.elig?.canPayout)).length)
+const seasonClaimBlocked = computed(() => seasonComplete.value && pendingPayableClaims.value > 0)
 const advancing = ref(false)
 async function advance() {
   if (advancing.value) return
@@ -178,7 +186,7 @@ function resume() { if (active.value) emit('view', active.value, 'live') }
 
     <!-- 未修禁赛浮条：自有艇有未结案事故维修工单，完成维修验收前不能开赛 -->
     <transition name="pop">
-      <button v-if="repairBlocked && !active" class="repair-block-hud" @click="emit('repair')">
+      <button v-if="repairBlocked && !active && !seasonRepairBlocked" class="repair-block-hud" @click="emit('repair')">
         <span>🔧</span>
         自有艇有 {{ store.repairs.openCount }} 张事故维修工单未结案，<b>未修复不得参赛</b> · 点击前往派工维修验收
         <b>▶</b>
@@ -192,8 +200,16 @@ function resume() { if (active.value) emit('view', active.value, 'live') }
         <div class="se-main">
           <b>第 {{ store.team.season }} 赛季 6 站全部完赛！</b>
           <span>积分 / 赛站 / 合约 / 排行榜分层重置，资金飞艇与班底保留，往季回放随时可看</span>
+          <em v-if="seasonRepairBlocked" class="se-repair-warn">
+            🔧 {{ store.repairs.openCount }} 张事故维修工单未验收，先结案才能开启新赛季
+          </em>
+          <em v-else-if="seasonClaimBlocked" class="se-repair-warn">
+            🛡️ {{ pendingPayableClaims }} 笔可赔付理赔单未结案，先完成定损赔付才能开启新赛季
+          </em>
         </div>
-        <button class="se-go" :disabled="advancing" @click="advance">
+        <button v-if="seasonRepairBlocked" class="se-go se-go-repair" @click="emit('repair')">🔧 前往维修</button>
+        <button v-else-if="seasonClaimBlocked" class="se-go se-go-repair" @click="emit('insurance')">🛡️ 前往理赔</button>
+        <button v-else class="se-go" :disabled="advancing" @click="advance">
           {{ advancing ? '开启中…' : `🚀 进入第 ${store.team.season + 1} 赛季` }}
         </button>
       </div>

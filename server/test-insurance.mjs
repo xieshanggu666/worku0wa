@@ -1,7 +1,7 @@
 /**
  * 赛事事故与保险理赔 功能验证（年度额度制）
  * 覆盖：投保 / 事故生成 / 报案定损赔付状态机 / 同季连续理赔 / 年度额度封顶 /
- * 租约押金联动 / 自有艇维修联动 / 资金声望 / 并发幂等 / 赛季到期归档 /
+ * 租约押金联动 / 自有艇维修联动 / 资金声望 / 并发幂等 / 赛季到期归档（可赔付未决先阻断）/
  * 越站对称冲回（含年度额度恢复）/ 历史保单兼容迁移
  *
  * 用法：node --experimental-sqlite server/test-insurance.mjs（需要 Node ≥22.5 的 node:sqlite）
@@ -254,28 +254,46 @@ async function main() {
     const s4b = await api(PORT, '/api/state')
     eq('维护后部件恢复 100', s4b.airship.parts_dur, 100)
 
-    console.log('\n[赛季结算] 完季保单到期、未决理赔单拒付、事故统计归档')
-    await post(PORT, '/api/reset')
-    await post(PORT, '/api/insurance/buy', { id: 2 })
-    let pending = null, pendingIncId = null
-    for (let cid = 1; cid <= 6; cid++) {
-      const r = await playStation(PORT, cid)
-      if (r.settled.incident && !pending) pending = r
+    console.log('\n[赛季结算] 完季保单到期、可赔付未决单先阻断、赔付后归档')
+    let pending = null
+    for (let attempt = 0; attempt < 80 && !pending; attempt++) {
+      await post(PORT, '/api/reset')
+      await post(PORT, '/api/insurance/buy', { id: 2 })
+      for (let cid = 1; cid <= 6; cid++) {
+        const r = await playStation(PORT, cid)
+        if (r.settled.incident && !pending) pending = r
+      }
+      if (!pending) console.log('本赛季未出现事故，重置后重试完季理赔闸门')
     }
-    if (pending) {
-      const rp5 = await post(PORT, `/api/incidents/${pending.started.race.id}/report`, {})
-      pendingIncId = rp5.incident.id
-      await post(PORT, `/api/incidents/${pendingIncId}/assess`, {})  // 只定损，不赔付
+    if (!pending) throw new Error('多轮尝试后完季保单测试仍未遇到事故')
+    // 其余事故模拟车队主动放弃理赔，避免它们作为可赔付未决单影响本环节的单一闸门验证
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      dbh.prepare("UPDATE incidents SET status='rejected', rejected_at=? WHERE status='reported' AND race_id<>?")
+        .run(String(Date.now()), pending.started.race.id)
+      dbh.close()
     }
+    let pendingIncId = null
+    let pendingPayout = 0
+    const rp5 = await post(PORT, `/api/incidents/${pending.started.race.id}/report`, {})
+    pendingIncId = rp5.incident.id
+    await post(PORT, `/api/incidents/${pendingIncId}/assess`, {})  // 只定损，不赔付
+    const blockedAdv = await post(PORT, '/api/seasons/advance', {})
+    eq('可赔付未决单存在时拒绝衔接', blockedAdv.ok, false)
+    const payBefore = await post(PORT, `/api/incidents/${pendingIncId}/payout`, {})
+    ok('衔接前可正常完成赔付', payBefore.ok && payBefore.payout > 0)
+    pendingPayout = payBefore.payout
+    const repeatPay = await post(PORT, `/api/incidents/${pendingIncId}/payout`, {})
+    ok('赔付接口仍幂等', repeatPay.ok && repeatPay.already)
     const moneyBeforeAdv = (await api(PORT, '/api/state')).team.money
     const adv = await post(PORT, '/api/seasons/advance', {})
-    ok('衔接成功', adv.ok)
+    ok('理赔结案后衔接成功', adv.ok)
     eq('归档摘要带事故数', typeof adv.summary.incidents, 'number')
-    eq('归档摘要带赔付统计', adv.summary.payouts, 0) // 本轮没有已赔付的单子
+    eq('归档摘要带赔付统计', adv.summary.payouts, pendingPayout) // 已赔付款进入赛季归档
     if (pendingIncId) {
       const payLate = await post(PORT, `/api/incidents/${pendingIncId}/payout`, {})
-      eq('往季未决单赔付被拒', payLate.ok, false)
-      eq('拒付不产生资金变动', (await api(PORT, '/api/state')).team.money, moneyBeforeAdv)
+      ok('往季已赔单只幂等返回', payLate.ok && payLate.already)
+      eq('衔接后不产生额外资金变动', (await api(PORT, '/api/state')).team.money, moneyBeforeAdv)
     }
     const st5 = await api(PORT, '/api/state')
     eq('新赛季视角无有效保单（需重新投保）', st5.insurance.policy, null)

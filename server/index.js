@@ -760,7 +760,8 @@ function contractsPayload(season = teamCore().season) {
  *    历史战绩与排行榜均按赛季分层——老赛季的 races / race_log / contracts 一行不删，继续回放；
  *  - 资金、声望、飞艇（含部件健康）、改装件、机师技工（含经验/心情）、租约（含押金/场次/磨损归属）
  *    属于车队跨赛季资产，全部保留；排行榜快照存入 seasons，供「历届赛季榜」分层展示。
- * 幂等：以 seasons 中是否已有该季档案为唯一闸门（事务内二次校验），并发/重复衔接不产生两份档案。
+ * 幂等：以 seasons 中是否已有该季档案为唯一闸门（事务内二次校验），并发/重复衔接不产生两份档案；
+ * 未验收维修工单在完季时强制先结案，避免旧禁赛状态与新保单层叠加成死局。
  */
 // 某赛季滚动战绩统计（完季归档与「当前赛季行」共用同一口径）
 function seasonLiveStats(season) {
@@ -831,6 +832,22 @@ function advanceSeason() {
   if (finishedCount < cs.length) {
     return { status: 409, body: { ok: false, msg: `本赛季还有 ${cs.length - finishedCount} 站未完赛，暂不能进入新赛季` } }
   }
+  // 未验收工单或仍可赔付的未决理赔必须在完季处理完：否则新赛季自有艇会被旧工单继续禁赛，
+  // 而保单又已随旧赛季到期，玩家会落入「不能开赛 / 不能赔付」的死局。
+  const openRepairs = openRepairOrders()
+  if (openRepairs.length) {
+    return {
+      status: 409,
+      body: { ok: false, msg: `还有 ${openRepairs.length} 张事故维修工单未验收结案，暂不能进入新赛季`, openRepairCount: openRepairs.length }
+    }
+  }
+  const payableClaims = payablePendingIncidents(season)
+  if (payableClaims.length) {
+    return {
+      status: 409,
+      body: { ok: false, msg: `还有 ${payableClaims.length} 笔可赔付理赔单未结案，请先完成定损与赔付`, pendingClaimCount: payableClaims.length }
+    }
+  }
 
   let body
   db.exec('BEGIN IMMEDIATE')
@@ -838,6 +855,12 @@ function advanceSeason() {
     // 事务内二次闸门：同步并发下只有一个衔接请求能穿过
     if (get('SELECT season FROM seasons WHERE season=?', season)) {
       body = { ok: true, already: true, msg: '新赛季已经开启', season: season + 1 }
+    } else if (openRepairOrders().length) {
+      db.exec('ROLLBACK')
+      return { status: 409, body: { ok: false, msg: '事故维修工单验收结案前不能进入新赛季' } }
+    } else if (payablePendingIncidents(season).length) {
+      db.exec('ROLLBACK')
+      return { status: 409, body: { ok: false, msg: '可赔付理赔单结案前不能进入新赛季' } }
     } else {
       // 1) 归档老赛季最终战绩到排行榜（races/race_log/contracts 原样保留，回放不受影响）
       const live = seasonLiveStats(season)
@@ -853,8 +876,8 @@ function advanceSeason() {
       run('UPDATE circuits SET finished=0, rank=NULL')
       // 4) 新赛季合约按当前配置重签（老合约行保留，进度按各自赛季的比赛记录现算，互不串账）
       ensureContracts(nextSeason)
-      // 5) 保险按赛季分层：老赛季有效保单自然到期（不退保险费）；当季已报案/定损但未赔付的
-      //    理赔单一律拒付结案（赛季结束是保险责任的终点），已赔付的不受影响、原样归档可查
+      // 5) 保险按赛季分层：老赛季有效保单自然到期（不退保险费）；仍可赔付的未决单已在事务外/事务内
+      //    闸门拦截，这里只拒付无保障、保单后生效或额度用尽等已无赔付可能的留档单，已赔付原样归档
       run("UPDATE insurance SET status='expired', expired_at=? WHERE season=? AND status='active'", now(), season)
       run("UPDATE incidents SET status='rejected', rejected_at=? WHERE season=? AND status IN ('reported','assessed')",
         now(), season)
@@ -882,7 +905,8 @@ function advanceSeason() {
  * （reported）。车队随后可按事故状态连续处理：定损（服务端按出赛艇归属核定维修费用）→
  * 赔付（当季有效保单、且保单先于开赛存在，按 coverage、单次上限与剩余年度额度核定，
  * 年度额度内不限理赔次数，付款幂等）。
- * 保单按赛季分层：衔接新赛季时有效保单到期、未决理赔单拒付；越站作废按结算口径对称冲回
+ * 保单按赛季分层：衔接新赛季时有效保单到期，仅无赔付条件的未决留档单拒付，可赔付未决单先阻断衔接；
+ * 越站作废按结算口径对称冲回
  * （已赔付的赔款冲回、保单年度额度同步恢复；历史单季一次制保单 claimed→active）。
  * 所有资金/声望改动都在调用方事务边界一次完成。
  */
@@ -908,6 +932,15 @@ function repairQuote(mechanic, damage) {
 // 全部未结案（未验收）的自有艇维修工单：存在时该自有艇禁止参赛、禁止常规维护
 function openRepairOrders() {
   return all("SELECT * FROM repair_orders WHERE status IN ('draft','assigned','repaired') ORDER BY id ASC")
+}
+// 已报案/定损且当前仍满足赔付条件的理赔单：完季衔接前必须给玩家保留赔付窗口，
+// 不能先因工单处理流程拖到保单到期，再把本可赔付的未决单一律拒付。
+function payablePendingIncidents(season) {
+  return all("SELECT * FROM incidents WHERE season=? AND status IN ('reported','assessed')", season)
+    .filter(inc => {
+      const elig = claimEligibility(inc, season)
+      return !!(elig.policy && (elig.canAssess || elig.canPayout))
+    })
 }
 function repairOrderRowByRace(raceId) {
   return get('SELECT * FROM repair_orders WHERE race_id=?', Number(raceId))
@@ -1832,9 +1865,9 @@ app.post('/api/races/:id/settle', (req, res) => {
   }
 })
 
-// 新赛季衔接：6 站完赛后由玩家确认触发。归档老赛季排行榜快照、重置积分/赛站/合约滚动层，
+// 新赛季衔接：6 站完赛、事故维修工单全部验收、可赔付未决理赔全部处理后由玩家确认触发。归档老赛季排行榜快照、重置积分/赛站/合约滚动层，
 // 老赛季 races/race_log/contracts 原样保留（历史战绩与回放不丢）；车队资金/声望/装备/人员/租约保留。
-// 幂等：重复点击 / 并发重放只衔接一次（seasons 归档行为唯一闸门）
+// 幂等：重复点击 / 并发重放只衔接一次（seasons 归档行为唯一闸门）；未结案工单或可赔付理赔返回 409。
 app.post('/api/seasons/advance', (_, res) => {
   const r = advanceSeason()
   return res.status(r.status).json(r.body)
@@ -1868,7 +1901,7 @@ app.post('/api/incidents/:id/assess', (req, res) => {
   return res.status(r.status).json(r.body)
 })
 
-// 赔付：当季有效保单（且先于开赛）按 coverage × 定损额（上限封顶）一次到账，保单结案；幂等
+// 赔付：当季有效保单（且先于开赛）按 coverage × 定损额（上限封顶）到账，保单继续保留年度额度；幂等
 app.post('/api/incidents/:id/payout', (req, res) => {
   const r = payoutIncident(Number(req.params.id))
   return res.status(r.status).json(r.body)

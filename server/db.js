@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS insurance (
 );
 -- 赛事事故与理赔单（一体）：事故在开赛瞬间随比赛记录确定性生成（incident 快照），
 -- 但只有已结算比赛才能报案——退赛/作废记录的事故不可理赔。一案一次赔付，全链路幂等。
--- status: none 无事故（不建物理行）| reported 已报案待定损 | assessed 已定损待赔付 | paid 已赔付结案 | rejected 理赔拒付
+-- status: none 无事故（不建物理行）| reported 已报案待定损 | assessed 已定损待赔付 | paid 已赔付结案 | rejected 无赔付条件后随赛季结束拒付
 CREATE TABLE IF NOT EXISTS incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   race_id INTEGER NOT NULL UNIQUE,   -- 一场比赛至多一起事故

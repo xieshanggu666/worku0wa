@@ -61,7 +61,7 @@ function jumpInsurance() { drawer.value = 'insurance' }
     </header>
 
     <!-- 主游戏场景：云海浮岛航线图 -->
-    <MainScene class="scene" @view="openRace" @repair="openRepair" />
+    <MainScene class="scene" @view="openRace" @repair="openRepair" @insurance="openInsurance" />
 
     <!-- 竞速镜头：live（开赛/续看）或 replay（历史回放） -->
     <RaceAnim v-if="viewing" :race="viewing.race" :mode="viewing.mode" @back="goBack" @claim="gotoClaim" @repair="gotoRepair" />
